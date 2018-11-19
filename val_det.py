@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
-from data import VOC_ROOT, VOCAnnotationTransform, VOCDetection, BaseTransform
-from data import VOC_CLASSES as labelmap
+from data import VID_ROOT, DETDetection,  BaseTransform
+from data import DET_CLASSES as labelmap
 import torch.utils.data as data
 
 from ssd import build_ssd
@@ -32,21 +32,24 @@ else:
 def str2bool(v):
     return v.lower() in ("yes", "true", "t", "1")
 
+DET_ROOT = "/home/liyang/data/DET/ILSVRC"
 
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Evaluation')
 parser.add_argument('--trained_model',
-                    default='weights/ssd300_mAP_77.43_v2.pth', type=str,
+                    default='weights/DET.pth', type=str,
                     help='Trained state_dict file path to open')
-parser.add_argument('--save_folder', default='eval/', type=str,
+parser.add_argument('--save_folder', default='eval/DET/', type=str,
                     help='File path to save results')
+parser.add_argument('--seq_len', type=int, default=4, help="number of images to sample in a tracklet")
+
 parser.add_argument('--confidence_threshold', default=0.01, type=float,
                     help='Detection confidence threshold')
 parser.add_argument('--top_k', default=5, type=int,
                     help='Further restrict the number of predictions to parse')
 parser.add_argument('--cuda', default=True, type=str2bool,
                     help='Use cuda to train model')
-parser.add_argument('--voc_root', default=VOC_ROOT,
+parser.add_argument('--det_root', default=DET_ROOT,
                     help='Location of VOC root directory')
 parser.add_argument('--cleanup', default=True, type=str2bool,
                     help='Cleanup and remove results files following eval')
@@ -66,12 +69,11 @@ if torch.cuda.is_available():
 else:
     torch.set_default_tensor_type('torch.FloatTensor')
 
-annopath = os.path.join(args.voc_root, 'VOC2007', 'Annotations', '%s.xml')
-imgpath = os.path.join(args.voc_root, 'VOC2007', 'JPEGImages', '%s.jpg')
-imgsetpath = os.path.join(args.voc_root, 'VOC2007', 'ImageSets',
-                          'Main', '{:s}.txt')
+annopath = os.path.join(args.det_root, 'Annotations', 'DET', 'val', '%s.xml')
+imgpath = os.path.join(args.det_root, 'Data', 'DET', 'val', '%s.JPEG')
+imgsetpath = os.path.join(args.det_root, 'ImageSets', 'DET', '%s.txt')
 YEAR = '2007'
-devkit_path = args.voc_root + 'VOC' + YEAR
+devkit_path = '/home/liyang/experiment/ssd.pytorch-master/devkit/DET'
 dataset_mean = (104, 117, 123)
 set_type = 'val'
 
@@ -108,9 +110,9 @@ def parse_rec(filename):
     for obj in tree.findall('object'):
         obj_struct = {}
         obj_struct['name'] = obj.find('name').text
-        obj_struct['pose'] = obj.find('pose').text
-        obj_struct['truncated'] = int(obj.find('truncated').text)
-        obj_struct['difficult'] = int(obj.find('difficult').text)
+        # obj_struct['pose'] = obj.find('pose').text
+        # obj_struct['truncated'] = int(obj.find('truncated').text)
+        # obj_struct['difficult'] = int(obj.find('difficult').text)
         bbox = obj.find('bndbox')
         obj_struct['bbox'] = [int(bbox.find('xmin').text) - 1,
                               int(bbox.find('ymin').text) - 1,
@@ -153,6 +155,10 @@ def write_voc_results_file(all_boxes, dataset):
                 if dets == []:
                     continue
                 # the VOCdevkit expects 1-based indices
+                # print('result: {:s} {:.3f} {:.1f} {:.1f} {:.1f} {:.1f}\n'.
+                #         format(index[1], dets[0, -1],
+                #                dets[0, 0] + 1, dets[0, 1] + 1,
+                #                dets[0, 2] + 1, dets[0, 3] + 1))
                 for k in range(dets.shape[0]):
                     f.write('{:s} {:.3f} {:.1f} {:.1f} {:.1f} {:.1f}\n'.
                             format(index[1], dets[k, -1],
@@ -171,7 +177,7 @@ def do_python_eval(output_dir='output', use_07=True):
     for i, cls in enumerate(labelmap):
         filename = get_voc_results_file_template(set_type, cls)
         rec, prec, ap = voc_eval(
-           filename, annopath, imgsetpath.format(set_type), cls, cachedir,
+           filename, annopath, imgsetpath % set_type, cls, cachedir,
            ovthresh=0.5, use_07_metric=use_07_metric)
         aps += [ap]
         print('AP for {} = {:.4f}'.format(cls, ap))
@@ -261,7 +267,7 @@ cachedir: Directory for caching the annotations
     # read list of images
     with open(imagesetfile, 'r') as f:
         lines = f.readlines()
-    imagenames = [x.strip() for x in lines]
+    imagenames = [x.strip().split(' ')[0] for x in lines]
     if not os.path.isfile(cachefile):
         # load annots
         recs = {}
@@ -363,60 +369,63 @@ cachedir: Directory for caching the annotations
 
 def test_net(save_folder, net, cuda, dataset, transform, top_k,
              im_size=300, thresh=0.05):
+
     num_images = len(dataset)
+
     # all detections are collected into:
     #    all_boxes[cls][image] = N x 5 array of detections in
     #    (x1, y1, x2, y2, score)
-    all_boxes = [[[] for _ in range(num_images)]
-                 for _ in range(len(labelmap)+1)]
-
-    # timers
-    _t = {'im_detect': Timer(), 'misc': Timer()}
-    output_dir = get_output_dir('ssd300_voc', set_type)
+    # all_boxes = [[[] for _ in range(num_images)]
+    #              for _ in range(len(labelmap)+1)]
+    #
+    # # timers
+    # _t = {'im_detect': Timer(), 'misc': Timer()}
+    output_dir = get_output_dir('ssd300_det_120000', set_type)
     det_file = os.path.join(output_dir, 'detections.pkl')
+    #
+    # for i in range(num_images):
+    #     im, gt, h, w = dataset.pull_item(i)
+    #
+    #     x = Variable(im.unsqueeze(0))
+    #     if args.cuda:
+    #         x = x.cuda()
+    #     _t['im_detect'].tic()
+    #     detections = net(x).data
+    #     #print('index:',i,detections.size())
+    #     detect_time = _t['im_detect'].toc(average=False)
+    #
+    #     # skip j = 0, because it's the background class
+    #     for j in range(1, detections.size(1)):
+    #         dets = detections[0, j, :]
+    #         mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
+    #         dets = torch.masked_select(dets, mask).view(-1, 5)
+    #         if dets.size(0) == 0:
+    #             continue
+    #         boxes = dets[:, 1:]
+    #         boxes[:, 0] *= w
+    #         boxes[:, 2] *= w
+    #         boxes[:, 1] *= h
+    #         boxes[:, 3] *= h
+    #         scores = dets[:, 0].cpu().numpy()
+    #         cls_dets = np.hstack((boxes.cpu().numpy(),
+    #                               scores[:, np.newaxis])).astype(np.float32,
+    #                                                              copy=False)
+    #         all_boxes[j][i] = cls_dets
+    #
+    #     print('im_detect: {:d}/{:d} {:.3f}s'.format(i + 1,
+    #                                                 num_images, detect_time))
+    #
+    # with open(det_file, 'wb') as f:
+    #     pickle.dump(all_boxes, f, pickle.HIGHEST_PROTOCOL)
 
-    for i in range(num_images):
-        im, gt, h, w = dataset.pull_item(i)
-
-        x = Variable(im.unsqueeze(0))
-        if args.cuda:
-            x = x.cuda()
-        _t['im_detect'].tic()
-        detections = net(x).data
-        detect_time = _t['im_detect'].toc(average=False)
-
-        # skip j = 0, because it's the background class
-        for j in range(1, detections.size(1)):
-            dets = detections[0, j, :]
-            mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
-            dets = torch.masked_select(dets, mask).view(-1, 5)
-            if dets.size(0) == 0:
-            #if dets.dim() == 0:   original
-                continue
-            boxes = dets[:, 1:]
-            boxes[:, 0] *= w
-            boxes[:, 2] *= w
-            boxes[:, 1] *= h
-            boxes[:, 3] *= h
-            scores = dets[:, 0].cpu().numpy()
-            cls_dets = np.hstack((boxes.cpu().numpy(),
-                                  scores[:, np.newaxis])).astype(np.float32,
-                                                                 copy=False)
-            all_boxes[j][i] = cls_dets
-
-        print('im_detect: {:d}/{:d} {:.3f}s'.format(i + 1,
-                                                    num_images, detect_time))
-
-    with open(det_file, 'wb') as f:
-        pickle.dump(all_boxes, f, pickle.HIGHEST_PROTOCOL)
-
+    all_boxes = pickle.load(open(det_file,'rb'))
     print('Evaluating detections')
     evaluate_detections(all_boxes, output_dir, dataset)
 
 
 def evaluate_detections(box_list, output_dir, dataset):
     write_voc_results_file(box_list, dataset)
-    do_python_eval(output_dir)
+    do_python_eval(output_dir, False)
 
 
 if __name__ == '__main__':
@@ -427,9 +436,10 @@ if __name__ == '__main__':
     net.eval()
     print('Finished loading model!')
     # load data
-    dataset = VOCDetection(args.voc_root, [('2007', set_type)],
-                           BaseTransform(300, dataset_mean),
-                           VOCAnnotationTransform())
+    # dataset = VOCDetection(args.voc_root, [('2007', set_type)],
+    #                        BaseTransform(300, dataset_mean),
+    #                        VOCAnnotationTransform())
+    dataset = DETDetection(root=DET_ROOT, phase='val', transform=BaseTransform(300, dataset_mean))
     if args.cuda:
         net = net.cuda()
         cudnn.benchmark = True

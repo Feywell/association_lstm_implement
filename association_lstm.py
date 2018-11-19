@@ -12,6 +12,7 @@ from lib.model.utils.net_utils import _affine_grid_gen
 from utils.viz import plot_bbox, plot_image
 from matplotlib import pyplot as plt
 from bnlstm import BNLSTM
+from layers.modules import MultiProjectLoss
 
 class association_lstm(nn.Module):
     """Single Shot Multibox Architecture
@@ -54,13 +55,17 @@ class association_lstm(nn.Module):
         self.grid_size = self.cfg['POOLING_SIZE'] * 2 if self.cfg['CROP_RESIZE_WITH_MAX_POOL'] else self.cfg['POOLING_SIZE']
         self.roi_crop = _RoICrop()
         self.img_shape = (self.cfg['min_dim'],self.cfg['min_dim'])
+        self.tensor_len = 4+self.num_classes+49
         self.bnlstm1 = BNLSTM(input_size=84, hidden_size=150, batch_first=False, bidirectional=False)
         self.bnlstm2 = BNLSTM(input_size=150, hidden_size=300, batch_first=False, bidirectional=False)
-
+        self.cls_pred = nn.Linear(300, self.num_classes)
+        self.bbox_pred = nn.Linear(300, 4)
+        self.association_pred = nn.Linear(300, 49)
+        self.MultiProjectLoss = MultiProjectLoss(self.num_classes, 0, True, 3, 0.5 )
         if phase == 'vid_train':
             self.softmax = nn.Softmax(dim=-1)
-            self.detect = Trnsform_target(num_classes, 200, 0.5, 0.01, 0.45)
-
+            #self.detect = Trnsform_target(num_classes, 200, 0.5, 0.01, 0.45)
+            self.detect = train_target(num_classes, 200, 0.5, 0.01, 0.45)
     def forward(self, x, targets):
         """Applies network layers and ops on input image(s) x.
 
@@ -115,12 +120,20 @@ class association_lstm(nn.Module):
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
         if self.phase == "vid_train":
+            """
             output = self.detect(
                 loc.view(loc.size(0), -1, 4),                   # loc preds
                 self.softmax(conf.view(conf.size(0), -1, self.num_classes)),                # conf preds
                 #conf.view(conf.size(0), -1, self.num_classes),
                 self.priors.type(type(x.data)),                 # default boxes
                 targets
+            )
+            """
+            output = self.detect(
+                loc.view(loc.size(0), -1, 4),                   # loc preds
+                self.softmax(conf.view(conf.size(0), -1, self.num_classes)),                # conf preds
+                #conf.view(conf.size(0), -1, self.num_classes),
+                self.priors.type(type(x.data)),                 # default boxes
             )
         else:
             output = (
@@ -132,9 +145,11 @@ class association_lstm(nn.Module):
             # print('output value: ', output[0], output[1])
             return output                            # 临时返回
 
-        rois, loc, conf, loc_t, conf_t = output  # rois size: batchsize, top_k, 5 
+        #rois, loc, conf, loc_t, conf_t = output  # rois size: batchsize, top_k, 5 
+        rois, loc, conf, priors = output
+       # print('after transform conf_t: ',conf_t)
         
-        print('display rois values: \n',rois[0,0:4,:])
+     #   print('display rois values: \n',rois[0,0:4,:])
         img_scale = torch.Tensor([self.img_shape[1], self.img_shape[0],
                           self.img_shape[1], self.img_shape[0]])
         
@@ -146,7 +161,7 @@ class association_lstm(nn.Module):
       #  plot_bbox(display_img, bboxes[:5,:].cpu(), ax=ax2)
       #  plt.show()
         rois[:,:,1:] = rois[:,:,1:]*img_scale
-        print('display scaled rois values: \n',rois.size(),rois[:,0:4,:])
+       # print('display scaled rois values: \n',rois.size(),rois[:,0:4,:])
         if self.cfg['POOLING_MODE'] == 'crop':
             # pdb.set_trace()
             # pooled_feat_anchor = _crop_pool_layer(base_feat, rois.view(-1, 5))
@@ -160,31 +175,44 @@ class association_lstm(nn.Module):
         elif self.cfg['POOLING_MODE'] == 'pool':
             pooled_feat = self.roi_pool(roi_feat, rois.view(-1,5))
 
-        print('after roi feature size: ',pooled_feat.size())
+      #  print('after roi feature size: ',pooled_feat.size())
         Con1_1 = nn.Conv2d(1024, 1, kernel_size=1, padding=0, dilation=1)
         pooled_feat = Con1_1(pooled_feat)
-        print('after conv1_1 feature size: ',pooled_feat.size())
+      #  print('after conv1_1 feature size: ',pooled_feat.size())
         scale = L2Norm(1, 20)
         normlize_feat = scale(pooled_feat)
-        print('normlize feature size: ', normlize_feat.size())
+      #  print('normlize feature size: ', normlize_feat.size())
         feat = normlize_feat.view(normlize_feat.size(0), normlize_feat.size(1), -1)
         #feat = pooled_feat.view(pooled_feat.size(0), pooled_feat.size(1), -1)
-        print('after reshape feat size: ',feat.size())
+      #  print('after reshape feat size: ',feat.size())
         feat = feat.squeeze().view(batch_size, feat.size(0)/batch_size, -1)
-        print('after slice feat size: ',feat.size())
+      #  print('after slice feat size: ',feat.size())
         
-        print('loc size: ',loc.size(), '\nconf size: ',conf.size())
+     #   print('loc size: ',loc.size(), '\nconf size: ',conf.size())
         stacked_tensor = torch.cat((conf,loc,feat),-1)
-        print('stacked_tensor size: ',stacked_tensor.size(),'\n',stacked_tensor[:,:2,:])
-        o1, h1 = self.bnlstm1(stacked_tensor)
+      #  print('stacked_tensor size: ',stacked_tensor.size(),'\n',stacked_tensor[:,:2,:])
+        o1, _ = self.bnlstm1(stacked_tensor)
         print('output1 size: ',o1.size())
-        print('hidden1 size: ',len(h1),h1[0].size(),h1[1].size())
-        o2, h2 = self.bnlstm2(o1)
+        #print('hidden1 size: ',len(h1),h1[0].size(),h1[1].size())
+        o2, _ = self.bnlstm2(o1)
         print('output2 size: ',o2.size())
-        print('hidden2 size: ',len(h2),h2[0].size(),h2[1].size())
-
+        #print('hidden2 size: ',len(h2),h2[0].size(),h2[1].size())
+        cls_pred = self.cls_pred(o2)
+        print('cls_pred size: ',cls_pred.size())
+        bbox_pred = self.bbox_pred(o2)
+        print('bbox_pred size: ',bbox_pred.size())
+        association_pred = self.association_pred(o2)
+        print('association_pred size: ',association_pred.size())
+        #loc_t, conf_t
+        #print('loc_t size: ', loc_t.size())
+       # print('conf_t size: ', conf_t.size())
+        print('conf size: ',conf.size())
+       # loc_loss, cls_loss = self.MultiProjectLoss(cls_pred, bbox_pred, association_pred, loc_t, conf_t)
+       ## print('loc_loss size: ',loc_loss.size())
+       ## print('cls_loss size: ',cls_loss.size())
      #   pooled_feat = pooled_feat.view(pooled_feat.size(0), pooled_feat.size(1), -1)
-
+        print('output priors size: ',priors.size())
+        return bbox_pred, cls_pred, self.priors
 
     def load_weights(self, base_file):
         other, ext = os.path.splitext(base_file)
